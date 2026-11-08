@@ -247,6 +247,12 @@ def patchelf_dynamic_library():
 
 
 
+def get_pybind11_abi_constants():
+    import torch
+    names = ("PYBIND11_COMPILER_TYPE", "PYBIND11_STDLIB", "PYBIND11_BUILD_ABI")
+    return {name: getattr(torch._C, "_" + name) for name in names}
+
+
 def CppExtension(name, sources, *args, **kwargs):
     r'''
     Creates a :class:`setuptools.Extension` for C++.
@@ -270,6 +276,9 @@ def CppExtension(name, sources, *args, **kwargs):
     libraries.append('hccl')
     kwargs['libraries'] = libraries
     kwargs['language'] = 'c++'
+    kwargs['define_macros'] = kwargs.get('define_macros', []) + [
+        (name, '"' + value + '"') for name, value in get_pybind11_abi_constants().items()
+    ]
     return Extension(name, sources, *args, **kwargs)
 
 
@@ -344,6 +353,7 @@ class CPPLibBuild(build_clib, object):
             '-DPYTHON_INCLUDE_DIR=' + get_paths().get('include'),
             '-DTORCH_VERSION=' + VERSION,
             '-DPYTORCH_INSTALL_DIR=' + get_pytorch_dir()]
+        cmake_args.extend('-D' + name + '=' + value for name, value in get_pybind11_abi_constants().items())
 
         if DISABLE_TORCHAIR == 'FALSE':
             if check_torchair_valid(BASE_DIR):

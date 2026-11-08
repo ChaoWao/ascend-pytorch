@@ -3,6 +3,11 @@
 #include <ATen/Tensor.h>
 #include <c10/core/Device.h>
 #include <c10/util/flat_hash_map.h>
+#include <exception>
+#include <memory>
+#include <vector>
+
+struct SimplerNativeSubmission;
 
 #include "third_party/acl/inc/acl/acl_base.h"
 #include "third_party/acl/inc/acl/acl_rt.h"
@@ -44,7 +49,10 @@ TORCH_NPU_API void unsubscribe_report(uint64_t threadId, c10_npu::NPUStream stre
 
 struct TORCH_NPU_API NPUGraph {
     NPUGraph();
-    ~NPUGraph();
+    ~NPUGraph() noexcept;
+    // Queue frames may pin State; graph wrappers never share cleanup authority.
+    NPUGraph(const NPUGraph&) = delete;
+    NPUGraph& operator=(const NPUGraph&) = delete;
 
     static void inc_pending_event_queries();
     static void dec_pending_event_queries();
@@ -65,41 +73,23 @@ struct TORCH_NPU_API NPUGraph {
     void super_kernel_optimize(const aclskOptions *options);
 
 protected:
-    aclmdlRI model_ri_ = nullptr;
-
     static std::atomic<int> pending_event_queries;
 
-    // Set to true in capture_end if NPU graph is captured succeeded
-    bool has_graph_exec_ = false;
+private:
+    struct State;
+    struct NativeEntry;
+    struct NativeQueueContext;
+    std::shared_ptr<State> state_;
+    SimplerNativeSubmission register_native_submission(
+        const SimplerNativeSubmission& submission, std::vector<at::Tensor> tensors);
+    void reset_impl();
+    void close_native_admission();
+    void cancel_native_pending();
+    std::exception_ptr native_submission_error() const;
+    void release_native_resources();
+    friend struct NPUGraphNativeAccess;
+    friend struct at_npu::NPUGeneratorState;
 
-    // the ID assigned by cuda during graph capture,
-    // used to identify when a stream is participating in capture
-    CaptureId_t capture_id_ = -1;
-
-    // uuid used to request a particular private mempool from CUDACachingAllocator.
-    // By default, this will be set to {id_, 0}.
-    //
-    // If capture_begin is called with "pool=other_graph.pool()", this graph's mempool_id_
-    // will be set to the other graph's mempool_id_, and therefore share a mempool with the
-    // other graph.
-    //
-    // If capture_begin is called with "pool=handle" where "handle" came from graph_pool_handle(),
-    // it will share a mempool with any other captures that used "pool=handle".
-    //
-    // Sharing a mempool across graphs saves memory, and it's safe if you
-    // know you'll replay those graphs in the same order you captured them.
-    MempoolId_t mempool_id_;
-
-    // Stream on which capture began
-    NPUStream capture_stream_;
-
-    // Device where capture occurred. Right now, for simplicity, we require all ops
-    // in a capture to run on the same device, but this is a limitation of CUDAGraph,
-    // not CUDA itself.  We can straightforwardly modify CUDAGraph to support multi-device
-    // captures if needed.
-    int capture_dev_;
-
-    ska::flat_hash_map<c10::intrusive_ptr<at_npu::NPUGeneratorState>, uint64_t> captured_generator_states_;
 };
 
 } // namespace c10_npu

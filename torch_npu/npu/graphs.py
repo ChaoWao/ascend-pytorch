@@ -15,6 +15,7 @@ __all__ = [
 import gc
 import logging
 import re
+import threading
 import typing
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -461,6 +462,14 @@ class NPUGraph(torch_npu._C._NPUGraph):
                                    f"got {type(value).__name__}", pta_error(ErrCode.PARAM))
 
 
+_native_graph_context = threading.local()
+
+
+def _current_native_graph():
+    # Caller/GIL-only route to the existing owner, never used by native callbacks.
+    return getattr(_native_graph_context, "graph", None)
+
+
 class graph:
     r"""Context-manager that captures NPU work into a :class:`torch.npu.NPUGraph` object for later replay.
 
@@ -514,6 +523,30 @@ class graph:
         self.npu_graph = npu_graph
         self.capture_error_mode = capture_error_mode
         self.npu_graph.auto_dispatch_capture = auto_dispatch_capture
+        self._previous_native_graph = None
+        self._native_route_installed = False
+
+    def _exit_contexts(self, primary, traceback, cleanup=None):
+        # Context restoration must not replace a body/Begin/End exception.
+        if self._native_route_installed:
+            _native_graph_context.graph = self._previous_native_graph
+            self._native_route_installed = False
+        self._previous_native_graph = None
+        for context in reversed(self._entered_contexts):
+            if context is None:
+                continue
+            try:
+                context.__exit__(type(primary) if primary is not None else None,
+                                 primary, traceback)
+            except BaseException as error:
+                if primary is None:
+                    primary, traceback = error, error.__traceback__
+                else:
+                    error.__context__ = None
+                    error.__cause__ = cleanup
+                    cleanup = error
+        self._entered_contexts.clear()
+        return primary, traceback, cleanup
 
     def __enter__(self):
         torch.npu.synchronize()
@@ -521,20 +554,42 @@ class graph:
             gc.collect()
         torch.npu.empty_cache()
 
-        # Stackoverflow seems comfortable with this pattern
-        self.stream_ctx.__enter__()
-        if self.npu_graph.auto_dispatch_capture:
-            self.npu_graph.graph_dispatch_mode.__enter__()
-        self.npu_graph.capture_begin(
-            *self.pool, capture_error_mode=self.capture_error_mode
-        )
+        self._entered_contexts = [None, None]
+        self._previous_native_graph = _current_native_graph()
+        try:
+            self.stream_ctx.__enter__()
+            self._entered_contexts[0] = self.stream_ctx
+            if self.npu_graph.auto_dispatch_capture:
+                self.npu_graph.graph_dispatch_mode.__enter__()
+                self._entered_contexts[1] = self.npu_graph.graph_dispatch_mode
+            # Install before Begin: any allocation failure still precedes SDK capture.
+            _native_graph_context.graph = self.npu_graph
+            self._native_route_installed = True
+            self.npu_graph.capture_begin(
+                *self.pool, capture_error_mode=self.capture_error_mode
+            )
+        except BaseException as primary:
+            primary, traceback, cleanup = self._exit_contexts(primary, primary.__traceback__)
+            if cleanup is not None:
+                raise primary.with_traceback(traceback) from cleanup
+            raise
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.npu_graph.capture_end()
-        if self.npu_graph.auto_dispatch_capture:
-            self.npu_graph.graph_dispatch_mode.__exit__(exc_type, exc_value, traceback)
-        self.stream_ctx.__exit__(exc_type, exc_value, traceback)
-        # returning None should propagate exceptions from either capture_end or stream_ctx.__exit__()
+        primary, cleanup = exc_value, None
+        try:
+            self.npu_graph.capture_end()
+        except BaseException as error:
+            if primary is None:
+                primary, traceback = error, error.__traceback__
+            else:
+                error.__context__ = None
+                cleanup = error
+        primary, traceback, cleanup = self._exit_contexts(primary, traceback, cleanup)
+        if cleanup is not None:
+            raise primary.with_traceback(traceback) from cleanup
+        if primary is not None and primary is not exc_value:
+            raise primary.with_traceback(traceback)
+        return False
 
 
 def make_graphed_callables(

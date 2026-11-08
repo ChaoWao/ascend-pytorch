@@ -135,6 +135,7 @@ void NPUGeneratorState::increase(uint64_t increment)
  */
 void NPUGeneratorState::register_graph(c10_npu::NPUGraph* graph)
 {
+    const void* key = graph->state_.get();
     // Ensures that the RNG state is not currently being captured.
     c10_npu::assertNotCapturing("Cannot register the state during capturing stage.");
 
@@ -142,14 +143,18 @@ void NPUGeneratorState::register_graph(c10_npu::NPUGraph* graph)
     // and offset on the GPU.
     if (registered_graphs_.empty()) {
         auto options = at::TensorOptions().device(at::kPrivateUse1).dtype(at::kLong);
-        seed_extragraph_ = at::empty({1}, options);
-        offset_extragraph_ = at::empty({1}, options);
+        auto seed = at::empty({1}, options);
+        auto offset = at::empty({1}, options);
+        registered_graphs_.insert(key);
+        seed_extragraph_ = std::move(seed);
+        offset_extragraph_ = std::move(offset);
+        return;
     }
 
     // Insert the graph into the set of registered graphs if it's not already
     // registered.
-    if (registered_graphs_.find(graph) == registered_graphs_.end()) {
-        registered_graphs_.insert(graph);
+    if (registered_graphs_.find(key) == registered_graphs_.end()) {
+        registered_graphs_.insert(key);
     }
 }
 
@@ -158,12 +163,13 @@ void NPUGeneratorState::register_graph(c10_npu::NPUGraph* graph)
  */
 void NPUGeneratorState::unregister_graph(c10_npu::NPUGraph* graph)
 {
+    const void* key = graph->state_.get();
     // Verify the graph was previously registered.
-    TORCH_CHECK(registered_graphs_.find(graph) != registered_graphs_.end(),
+    TORCH_CHECK(registered_graphs_.find(key) != registered_graphs_.end(),
                 "The graph should be registered to the state");
 
     // Remove the graph from the set of registered graphs.
-    registered_graphs_.erase(graph);
+    registered_graphs_.erase(key);
 
     // If no more graphs are registered, deallocate the GPU memory for the seed
     // and offset.
@@ -179,10 +185,10 @@ void NPUGeneratorState::unregister_graph(c10_npu::NPUGraph* graph)
  */
 void NPUGeneratorState::capture_prologue()
 {
-    capturing_ = true;
-    offset_intragraph_ = 0;
     seed_extragraph_.fill_(int64_t(seed_));
     offset_extragraph_.fill_(int64_t(0));
+    offset_intragraph_ = 0;
+    capturing_ = true;
 }
 
 /**
@@ -421,7 +427,6 @@ uint64_t NPUGeneratorImpl::philox_offset_per_thread() const
 void NPUGeneratorImpl::register_graph(c10_npu::NPUGraph* graph)
 {
     graph->register_generator_state(state_);
-    state_->register_graph(graph);
 }
 
 /**

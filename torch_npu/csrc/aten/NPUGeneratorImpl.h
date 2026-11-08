@@ -133,7 +133,8 @@ struct NPUGeneratorState : public c10::intrusive_ptr_target {
     uint32_t offset_intragraph_;
     bool capturing_{};
     bool secondary_stream_capture_state_{};
-    std::unordered_set<c10_npu::NPUGraph*> registered_graphs_;
+    // Internal membership identity is stable across wrapper destruction/reuse.
+    std::unordered_set<const void*> registered_graphs_;
     at::Tensor seed_extragraph_{};
     at::Tensor offset_extragraph_{};
 

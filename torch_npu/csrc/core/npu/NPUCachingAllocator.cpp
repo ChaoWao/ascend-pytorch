@@ -2090,22 +2090,24 @@ public:
     void beginAllocateToPool(MempoolId_t mempool_id, std::function<bool(aclrtStream)> filter)
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
-        auto it = graph_pools.find(mempool_id);
-        if (it == graph_pools.end()) {
-            // mempool_id does not reference an existing pool. Make a new pool for
-            // this capture.
-            graph_pools.emplace(mempool_id, std::make_unique<PrivatePool>());
-        } else {
-            // mempool_id references an existing pool, which the current capture will
-            // share. Check this pool is live (at least one other capture already
-            // references it).
-            TORCH_INTERNAL_ASSERT(it->second->use_count > 0);
-            it->second->use_count++;
+        for (const auto& capture : captures_underway) {
+            TORCH_CHECK(capture.first != mempool_id, "beginAllocateToPool: already recording to mempool_id");
         }
-        for (auto it2 = captures_underway.begin(); it2 != captures_underway.end(); ++it2) {
-            TORCH_CHECK(it2->first != mempool_id, "beginAllocateToPool: already recording to mempool_id");
+        auto it = graph_pools.find(mempool_id);
+        if (it != graph_pools.end()) {
+            TORCH_INTERNAL_ASSERT(it->second->use_count > 0);
         }
         captures_underway.emplace_back(mempool_id, std::move(filter));
+        try {
+            if (it == graph_pools.end()) {
+                graph_pools.emplace(mempool_id, std::make_unique<PrivatePool>());
+            } else {
+                ++it->second->use_count;
+            }
+        } catch (...) {
+            captures_underway.pop_back();
+            throw;
+        }
     }
 
     // Called by NPUGraph::capture_end
@@ -2142,15 +2144,15 @@ public:
         // (unsplit).
         auto it = graph_pools.find(mempool_id);
         TORCH_INTERNAL_ASSERT(it != graph_pools.end());
-        auto uc = --(it->second->use_count);
-        TORCH_INTERNAL_ASSERT(uc >= 0);
-        if (uc == 0) {
+        TORCH_INTERNAL_ASSERT(it->second->use_count > 0);
+        if (it->second->use_count == 1) {
             // Allows free_cached_blocks to begin npuFreeing this pool's memory,
             // and makes sure this pool wasn't somehow made freeable already.
             // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores)
             bool inserted = graph_pools_freeable.insert({ mempool_id, it->second.get() }).second;
             TORCH_INTERNAL_ASSERT(inserted);
         }
+        --it->second->use_count;
     }
 
 private:

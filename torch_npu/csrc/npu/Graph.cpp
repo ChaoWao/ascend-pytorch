@@ -5,9 +5,21 @@
 
 #include "op_plugin/OpApiInterface.h"
 #include "torch_npu/csrc/core/npu/NPUGraph.h"
+#include "torch_npu/csrc/core/npu/native_submission.h"
 #include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "torch_npu/csrc/npu/Event.h"
 #include "torch_npu/csrc/npu/Stream.h"
+
+namespace c10_npu {
+// Private binding access to the existing State; no additional graph owner.
+struct NPUGraphNativeAccess {
+    static SimplerNativeSubmission retain(NPUGraph& graph, const SimplerNativeSubmission& api,
+                                          std::vector<at::Tensor> tensors)
+    {
+        return graph.register_native_submission(api, std::move(tensors));
+    }
+};
+}
 
 template <typename T>
 using shared_ptr_class_ = py::class_<T, std::shared_ptr<T>>;
@@ -329,6 +341,34 @@ void TORCH_NPU_API THNPGraph_init(PyObject* module) {
 
     shared_ptr_class_<c10_npu::NPUGraph>(torch_N_m, "_NPUGraph")
         .def(py::init<>())
+        .def("_register_native_submission",
+            [](c10_npu::NPUGraph& self, py::capsule capsule, std::vector<at::Tensor> tensors) {
+                auto* origin = static_cast<SimplerNativeSubmission*>(
+                    PyCapsule_GetPointer(capsule.ptr(), SIMPLER_NATIVE_SUBMISSION_CAPSULE));
+                if (origin == nullptr) throw py::error_already_set();
+                auto api = std::make_unique<SimplerNativeSubmission>();
+                {
+                    py::gil_scoped_release no_gil;
+                    *api = c10_npu::NPUGraphNativeAccess::retain(self, *origin, std::move(tensors));
+                }
+                // Capsule failure drops only its queue frame. The original State
+                // already owns the registered entry and its checked cleanup.
+                try {
+                    py::capsule result(api.get(), SIMPLER_NATIVE_SUBMISSION_CAPSULE, [](PyObject* value) {
+                        auto* api = static_cast<SimplerNativeSubmission*>(
+                            PyCapsule_GetPointer(value, SIMPLER_NATIVE_SUBMISSION_CAPSULE));
+                        if (api != nullptr) {
+                            api->release(api->context);
+                            delete api;
+                        }
+                    });
+                    api.release();
+                    return result;
+                } catch (...) {
+                    api->release(api->context);
+                    throw;
+                }
+            })
         .def(
             "capture_begin",
             [](c10_npu::NPUGraph& self,

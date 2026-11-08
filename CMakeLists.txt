@@ -81,6 +81,13 @@ set(TORCHNPU_THIRD_PARTY_ROOT "${PROJECT_SOURCE_DIR}/third_party")
 set(Torch_DIR ${PYTORCH_INSTALL_DIR}/share/cmake/Torch)
 FIND_PACKAGE(Torch REQUIRED)
 
+# Core and subdirectory extensions share the selected Torch pybind11 registry.
+foreach(_pybind11_constant PYBIND11_COMPILER_TYPE PYBIND11_STDLIB PYBIND11_BUILD_ABI)
+  if(DEFINED ${_pybind11_constant})
+    add_compile_definitions("${_pybind11_constant}=\"${${_pybind11_constant}}\"")
+  endif()
+endforeach()
+
 set(LINUX TRUE)
 set(CMAKE_INSTALL_MESSAGE NEVER)
 #set(CMAKE_VERBOSE_MAKEFILE ON)
